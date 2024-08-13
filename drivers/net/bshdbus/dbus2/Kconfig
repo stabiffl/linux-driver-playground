@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+menu "BSH D-Bus-2 Drivers"
+
+config BSHDBUS_DBUS2_SN0200421
+	depends on SPI
+	tristate "BSH D-Bus-2 SN0200421 driver"
+	default y
+	help
+	  BSH D-Bus-2 driver for Texas Instruments SN0200421 chip.
+
+endmenu

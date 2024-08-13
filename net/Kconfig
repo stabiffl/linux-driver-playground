@@ -407,6 +407,7 @@ source "net/rxrpc/Kconfig"
 source "net/kcm/Kconfig"
 source "net/strparser/Kconfig"
 source "net/mctp/Kconfig"
+source "net/bshdbus/Kconfig"
 
 config FIB_RULES
 	bool

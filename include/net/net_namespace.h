@@ -37,6 +37,7 @@
 #include <net/netns/smc.h>
 #include <net/netns/bpf.h>
 #include <net/netns/mctp.h>
+#include <net/netns/bshdbus.h>
 #include <net/net_trackers.h>
 #include <linux/ns_common.h>
 #include <linux/idr.h>
@@ -187,6 +188,9 @@ struct net {
 	struct sock		*diag_nlsk;
 #if IS_ENABLED(CONFIG_SMC)
 	struct netns_smc	smc;
+#endif
+#if IS_ENABLED(CONFIG_BSHDBUS)
+	struct netns_bshdbus bshdbus;
 #endif
 } __randomize_layout;
 
