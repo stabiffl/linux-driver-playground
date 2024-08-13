@@ -159,6 +159,7 @@
 #define ETH_P_MCTP	0x00FA		/* Management component transport
 					 * protocol packets
 					 */
+#define ETH_P_BSHDBUS2	0x00FB	/* BSH D-Bus-2 protocol */
 
 /*
  *	This is an Ethernet frame header.

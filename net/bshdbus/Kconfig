@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# BSH D-Bus layer core configuration
+#
+menuconfig BSHDBUS
+	depends on NET
+	tristate "BSH D-Bus subsystem support"
+	help
+	  BSH D-Bus is the bus which is used in BSH household appliances for the
+	  communication between electronic control units.
+
+	  If you want BSH D-Bus support you should say Y here and also to the
+	  specific driver for your controller below.
+
+if BSHDBUS
+
+config BSHDBUS_DBUS2
+	tristate "BSH D-Bus-2 Protocol"
+	default y
+	help
+	  The raw BSH bus protocol option offers access to the BSH bus via
+	  the BSD socket API. You probably want to use the raw socket in
+	  most cases where no higher level protocol is being used.
+	  To receive/send raw BSH D-Bus-2 messages, use AF_BSHDBUS with protocol
+	  BSHDBUS_DBUS2.
+
+source "drivers/net/bshdbus/Kconfig"
+
+endif
