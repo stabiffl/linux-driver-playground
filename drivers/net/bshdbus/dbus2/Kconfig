@@ -8,4 +8,10 @@ config BSHDBUS_DBUS2_SN0200421
 	help
 	  BSH D-Bus-2 driver for Texas Instruments SN0200421 chip.
 
+config BSHDBUS_DBUS2_TEST
+	tristate "BSH D-Bus-2 test driver"
+	default n
+	help
+	  Testing driver for BSH D-Bus-2 subsystem.
+
 endmenu

@@ -1,5 +1,5 @@
 /*------------------------------------------------------------------------------
- Copyright 2023 BSH Hausgeraete GmbH
+ Copyright 2024 BSH Hausgeraete GmbH
 
  Redistribution and use in source and binary forms, with or without
  modification, are permitted provided that the following conditions are met:
@@ -33,25 +33,25 @@
 #include <linux/list.h>
 #include <linux/netdevice.h>
 
-struct bshdbus_dev_rcv_lists {
-	struct hlist_head rx;
+struct bshdbus_dev_rcvr_list {
+	struct hlist_head rcvr_list;
 	int entries;
 };
 
 struct bshdbus_ml_priv {
-	struct bshdbus_dev_rcv_lists dev_rcv_lists;
+	struct bshdbus_dev_rcvr_list bshdbus2_rcvr_list;
 };
 
 static inline struct bshdbus_ml_priv *bshdbus_get_ml_priv(
-		struct net_device *dev)
+		struct net_device *net_dev)
 {
-	return netdev_get_ml_priv(dev, ML_PRIV_BSHDBUS);
+	return netdev_get_ml_priv(net_dev, ML_PRIV_BSHDBUS);
 }
 
-static inline void bshdbus_set_ml_priv(struct net_device *dev,
+static inline void bshdbus_set_ml_priv(struct net_device *net_dev,
 		struct bshdbus_ml_priv *ml_priv)
 {
-	netdev_set_ml_priv(dev, ml_priv, ML_PRIV_BSHDBUS);
+	netdev_set_ml_priv(net_dev, ml_priv, ML_PRIV_BSHDBUS);
 }
 
 #endif /* BSHDBUS_ML_H */

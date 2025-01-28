@@ -1,5 +1,5 @@
 /*------------------------------------------------------------------------------
- Copyright 2023 BSH Hausgeraete GmbH
+ Copyright 2024 BSH Hausgeraete GmbH
 
  Redistribution and use in source and binary forms, with or without
  modification, are permitted provided that the following conditions are met:
@@ -33,6 +33,92 @@
 #include <linux/types.h>
 #include <linux/errno.h>
 #include <linux/socket.h>
+
+/* BSH D-Bus-2 maximum data length */
+#define BSHDBUS2_MAX_DATA_LEN 249
+
+#define BSHDBUS_MTU (sizeof(struct bshdbus2_frame))
+
+/* Netlink */
+#define BSHDBUS_NETLINK_NAME		"bshdbus"
+#define BSHDBUS_NETLINK_VERSION		1
+
+/**
+ * enum bshdbus_commands - supported BSH D-Bus commands
+ *
+ * @BSHDBUS_CMD_UNSPEC: unspecified command
+ *
+ * @BSHDBUS_CMD_SEND_MSG: send a BSH D-Bus-2 message
+ *
+ * @__BSHDBUS_CMD_MAX: only for internal use
+ * @BSHDBUS_CMD_MAX: maximum number of commands
+ */
+enum bshdbus_commands {
+	BSHDBUS_CMD_UNSPEC,
+	BSHDBUS_CMD_SEND_MSG,
+	__BSHDBUS_CMD_MAX,
+	BSHDBUS_CMD_MAX = __BSHDBUS_CMD_MAX - 1
+};
+
+/**
+ * enum bshdbus_nla - supported BSH D-Bus top level netlink attributes
+ *
+ * @BSHDBUS_NLA_UNSPEC: unspecified attribute
+ * @BSHDBUS_NLA_SEND_MSG: send a BSH D-Bus-2 message
+ * @__BSHDBUS_NLA_MAX: only for internal use
+ * BSHDBUS_NLA_MAX: maximum number of attributes
+ */
+enum bshdbus_nla {
+	BSHDBUS_NLA_UNSPEC,
+	BSHDBUS_NLA_SEND_MSG,
+	__BSHDBUS_NLA_MAX,
+	BSHDBUS_NLA_MAX = __BSHDBUS_NLA_MAX - 1
+};
+
+/**
+ * enum bshdbus_nla_send_msg - supported netlink attributes for send message
+ *
+ * BSHDBUS_NLA_SEND_MSG_UNSPEC: unspecified attribute
+ * BSHDBUS_NLA_SEND_MSG_ADDR: address byte
+ * BSHDBUS_NLA_SEND_MSG_ID_HIGH: message ID high byte
+ * BSHDBUS_NLA_SEND_MSG_ID_LOW: message ID low byte
+ * BSHDBUS_NLA_SEND_MSG_LEN: data length byte
+ * BSHDBUS_NLA_SEND_MSG_UNIQUE_ID: message unique ID
+ * BSHDBUS_NLA_SEND_MSG_DATA: data bytes
+ * @__BSHDBUS_NLA_SEND_MSG_MAX: only for internal use
+ * BSHDBUS_NLA_SEND_MSG_MAX: maximum number of attributes
+ */
+enum bshdbus_nla_send_msg {
+	BSHDBUS_NLA_SEND_MSG_UNSPEC,
+	BSHDBUS_NLA_SEND_MSG_ADDR,		/* u8 */
+	BSHDBUS_NLA_SEND_MSG_ID_HIGH,	/* u8 */
+	BSHDBUS_NLA_SEND_MSG_ID_LOW,	/* u8 */
+	BSHDBUS_NLA_SEND_MSG_LEN,		/* u8 */
+	BSHDBUS_NLA_SEND_MSG_UNIQUE_ID,	/* u64 */
+	BSHDBUS_NLA_SEND_MSG_DATA,		/* BSHDBUS2_MAX_DATA_LEN * u8 */
+	__BSHDBUS_NLA_SEND_MSG_MAX,
+	BSHDBUS_NLA_SEND_MSG_MAX = __BSHDBUS_NLA_SEND_MSG_MAX - 1
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /* BSH D-Bus kernel definitions */
 
@@ -73,7 +159,7 @@ struct bshdbus_sockaddr {
  * The message ID is divided into 1024 bit fields with 64 bit size, where every
  * BSH D-Bus-2 session can register several message ID ranges. Register the
  * message ID twice is not possible.
- * 
+ *
  * The message IDs are mapped to the structure bshdbus2_msg_id_range. For
  * example an entry for the message ID 0xFCB0 is represented with a single
  * range in the structure bshdbus2_msg_id_ranges like this:
@@ -85,8 +171,6 @@ struct bshdbus_sockaddr {
 #define BSHDBUS2_ID_MAX_RANGES	1024
 #define BSHDBUS2_IDS_PER_ORDER	64
 #define BSHDBUS2_ID_MAX_ORDER	(BSHDBUS2_ID_MAX_RANGES - 1)
-#define BSHDBUS2_ID_MASK_LSB	0x1
-#define BSHDBUS2_ID_MASK_MSB	0x80000000
 
 /* Convert BSH D-Bus-2 message ID high and low byte to message ID */
 static inline __u16 bshdbus2_get_msg_id(__u8 msg_id_high, __u8 msg_id_low)
@@ -100,58 +184,10 @@ static inline __u16 bshdbus2_get_id_order(__u16 msg_id)
 	return (msg_id / BSHDBUS2_IDS_PER_ORDER);
 }
 
-/* Get the message ID orders for the start and end message ID (ranges) */
-static inline int bshdbus2_get_id_orders(__u16 msg_id_start, __u16 msg_id_end,
-		__u16 *id_order_start, __u16 *id_order_end)
-{
-	if (msg_id_start > msg_id_end || !id_order_start || !id_order_end)
-		return -EINVAL;
-
-	*id_order_start = bshdbus2_get_id_order(msg_id_start);
-	*id_order_end = bshdbus2_get_id_order(msg_id_end);
-}
-
 /* Get the message ID mask bit */
 static inline __u64 bshdbus2_get_id_bit(__u16 msg_id)
 {
 	return (1 << (msg_id % BSHDBUS2_IDS_PER_ORDER));
-}
-
-/* Get the message ID orders and bit masks */
-static inline int bshdbus2_get_id_masks(__u16 msg_id_start, __u16 msg_id_end,
-		__u16 *id_order_start, __u16 *id_order_end, __u64 *id_mask_start,
-		__u64 *id_mask_end)
-{
-	__u64 id_start_bit;
-	__u64 id_end_bit;
-
-	if (msg_id_start > msg_id_end || !id_order_start || !id_order_end ||
-			!id_mask_start || !id_mask_end)
-		return -EINVAL;
-
-	bshdbus2_get_id_orders(msg_id_start, msg_id_end, id_order_start,
-			id_order_end);
-
-	id_start_bit = bshdbus2_get_id_bit(msg_id_start);
-
-	if (msg_id_start == msg_id_end) {
-		*id_mask_start = id_start_bit;
-		*id_mask_end = *id_mask_start;
-	}
-	else {
-		id_end_bit = bshdbus2_get_id_bit(msg_id_end);
-
-		if (*id_order_start != *id_order_end) {
-			*id_mask_start = (id_start_bit - BSHDBUS2_ID_MASK_LSB) |
-					id_start_bit;
-			*id_mask_end = (BSHDBUS2_ID_MASK_LSB - id_end_bit) |
-					BSHDBUS2_ID_MASK_LSB;
-		}
-		else {
-			*id_mask_start = (id_start_bit - id_end_bit) | id_start_bit;
-			*id_mask_start = *id_mask_end;
-		}
-	}
 }
 
 /**
@@ -175,30 +211,38 @@ struct bshdbus2_msg_id_ranges {
 	struct bshdbus2_msg_id_range *ranges;
 };
 
+/* Message types, filled by Kernel */
+enum {
+	BSHDBUS_MSG_TYPE_RX, /* Incoming message */
+	BSHDBUS_MSG_TYPE_TX_IND, /* Transmit indication */
+};
+
+/* Message flags for BSH D-Bus-2, filled by Kernel */
+#define BSHDBUS2_MSG_FLAG_TIMEOUT	BIT(0)	/* Message timed out */
+#define BSHDBUS2_MSG_FLAG_WRONG_ACK	BIT(1)	/* Wrong ACK received */
+
 /**
  * struct bshdbus2_frame - BSH D-Bus-2 frame structure
+ * @type: Type of the D-Bus-2 message, filled by Kernel
+ * @flags: Type specific message flags for D-Bus-2
+ * @__res0: reserved / padding
  * @addr: Address byte of the D-Bus-2 frame
  * @msg_id_high: High byte of the message ID
  * @msg_id_low: Low byte of the message ID
  * @data_len: Data length in bytes
- * @flags: Message flags for D-Bus-2
- * @__res0: reserved / padding
- * @__res1: reserved / padding
  * @unique_id: Unique frame ID used for transmission only
  * @data: Data bytes
  */
 struct bshdbus2_frame {
+	__u8 type;
+	__u16 flags;
+	__u8 __res0;
 	__u8 addr;
 	__u8 msg_id_high;
 	__u8 msg_id_low;
 	__u8 data_len;
-	__u16 flags;
-	__u8 __res0;
-	__u8 __res1;
 	__s64 unique_id;
 	__u8 data[BSHDBUS2_MAX_DATA_LEN] __attribute__((aligned(8)));
 };
-
-#define BSHDBUS2_MTU (sizeof(struct bshdbus2_frame))
 
 #endif /* !_UAPI_BSHDBUS_H */

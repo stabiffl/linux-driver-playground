@@ -1,5 +1,5 @@
 /*------------------------------------------------------------------------------
- Copyright 2023 BSH Hausgeraete GmbH
+ Copyright 2024 BSH Hausgeraete GmbH
 
  Redistribution and use in source and binary forms, with or without
  modification, are permitted provided that the following conditions are met:
@@ -39,7 +39,7 @@
 #include <linux/bshdbus/bshdbus-ml.h>
 #include "af_bshdbus.h"
 
-MODULE_DESCRIPTION("BSH D-Bus PF_BSHDBUS core");
+MODULE_DESCRIPTION("BSH D-Bus PF_BSHDBUS Core");
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Wolfgang Birkner <wolfgang.birkner@bshg.com>");
 MODULE_ALIAS_NETPROTO(PF_BSHDBUS);
@@ -51,7 +51,9 @@ static const struct bshdbus_proto __rcu
 		*proto_tab[BSHDBUS_NPROTO] __read_mostly;
 static DEFINE_MUTEX(proto_tab_lock);
 
-static atomic64_t unique_id = ATOMIC_INIT(0);
+
+#pragma GCC push_options
+#pragma GCC optimize ("O0")
 
 static const struct bshdbus_proto *bshdbus_get_proto(int protocol)
 {
@@ -84,7 +86,7 @@ static int bshdbus_create(struct net *net, struct socket *sock, int protocol,
 {
 	struct sock *sk;
 	const struct bshdbus_proto *proto;
-	int err = 0;
+	int ret = 0;
 
 	sock->state = SS_UNCONNECTED;
 
@@ -96,7 +98,7 @@ static int bshdbus_create(struct net *net, struct socket *sock, int protocol,
 		return -EPROTONOSUPPORT;
 
 	if (proto->type != sock->type) {
-		err = -EPROTOTYPE;
+		ret = -EPROTOTYPE;
 		goto err_put_proto;
 	}
 
@@ -104,7 +106,7 @@ static int bshdbus_create(struct net *net, struct socket *sock, int protocol,
 
 	sk = sk_alloc(net, PF_BSHDBUS, GFP_KERNEL, proto->prot, kern);
 	if (!sk) {
-		err = -ENOMEM;
+		ret = -ENOMEM;
 		goto err_put_proto;
 	}
 
@@ -112,24 +114,28 @@ static int bshdbus_create(struct net *net, struct socket *sock, int protocol,
 	sk->sk_destruct = bshdbus_sock_destruct;
 
 	if (sk->sk_prot->init)
-		err = sk->sk_prot->init(sk);
+		ret = sk->sk_prot->init(sk);
 
-	if (err) {
+	if (ret) {
 		/* release sk on errors */
 		sock_orphan(sk);
 		sock_put(sk);
 	}
 
+	return ret;
+
 err_put_proto:
 	bshdbus_put_proto(proto);
-	return err;
+	return ret;
 }
 
 /**
- * bshdbus2_send - transmit a BSH D-Bus-2 frame
- * @skb: Pointer to socket buffer with BSH D-Bus-2 frame in data section
+ * bshdbus_send - transmit a BSH D-Bus frame
+ * @skb: Pointer to socket buffer with BSH D-Bus frame in data section
+ * @protocol: BSH D-Bus Ethernet Protocol ID
  *
- * Due to the loopback this routine must not be called from hardirq context.
+ * Forward a BSH D-Bus frame to the hardware specific driver for transmitting
+ * it.
  *
  * Return:
  *  0 on success
@@ -137,208 +143,144 @@ err_put_proto:
  *  -ENOBUFS on full driver queue (see net_xmit_errno())
  *  -ENOMEM when local loopback failed at calling skb_clone()
  *  -EPERM when trying to send on a non-BSH-D-Bus interface
- *  -EMSGSIZE CAN frame size is bigger than BSH D-Bus-2 interface MTU
+ *  -EMSGSIZE when frame size is bigger than BSH D-Bus-2 interface MTU
+ *  -EPROTONOSUPPORT when trying to set a non-BSH-D-Bus Ethernet Protocol ID
  *  -EINVAL when the skb->data does not contain a valid BSH D-Bus-2 frame
  */
-int bshdbus2_send(struct sk_buff *skb)
+int bshdbus_send(struct sk_buff *skb, __be16 protocol)
 {
-	int err = -EINVAL;
-	struct sk_buff *newskb = NULL;
-	struct bshdbus2_frame *dbus2_frame = (struct bshdbus2_frame *)skb->data;
+	int ret;
 
-	if (unlikely(skb->len == BSHDBUS2_MTU)) {
-		skb->protocol = htons(ETH_P_BSHDBUS2);
-		if (unlikely(dbus2_frame->data_len > BSHDBUS2_MAX_DATA_LEN))
-			goto inval_skb;
-	} else {
+	if (unlikely(!skb))
+		return -EINVAL;
+
+	if (unlikely(protocol != htons(ETH_P_BSHDBUS2)))
+		ret = -EPROTONOSUPPORT;
 		goto inval_skb;
-	}
 
 	if (unlikely(skb->len > skb->dev->mtu)) {
-		err = -EMSGSIZE;
+		ret = -EMSGSIZE;
 		goto inval_skb;
 	}
 
 	if (unlikely(skb->dev->type != ARPHRD_BSHDBUS)) {
-		err = -EPERM;
+		ret = -EPERM;
 		goto inval_skb;
 	}
 
 	if (unlikely(!(skb->dev->flags & IFF_UP))) {
-		err = -ENETDOWN;
+		ret = -ENETDOWN;
 		goto inval_skb;
 	}
 
 	skb->ip_summed = CHECKSUM_UNNECESSARY;
+	skb->protocol = protocol;
 
 	skb_reset_mac_header(skb);
 	skb_reset_network_header(skb);
 	skb_reset_transport_header(skb);
 
-	/* indication for the BSH D-Bus driver: do loopback */
 	skb->pkt_type = PACKET_LOOPBACK;
 
-	if (!(skb->dev->flags & IFF_ECHO)) {
-		/* If the interface is not capable to do loopback
-		 * itself, we do it here.
-		 */
-		newskb = skb_clone(skb, GFP_ATOMIC);
-		if (!newskb) {
-			kfree_skb(skb);
-			return -ENOMEM;
-		}
+	ret = dev_queue_xmit(skb);
+	if (ret > 0)
+		ret = net_xmit_errno(ret);
 
-		/* If the socket has already been closed by user space, the
-		 * refcount may already be 0 (and the socket will be freed
-		 * after the last TX skb has been freed). So only increase
-		 * socket refcount if the refcount is > 0.
-		 */
-		if (skb->sk && refcount_inc_not_zero(&skb->sk->sk_refcnt)) {
-			newskb->destructor = sock_efree;
-			newskb->sk = skb->sk;
-		}
-		newskb->ip_summed = CHECKSUM_UNNECESSARY;
-		newskb->pkt_type = PACKET_BROADCAST;
-	}
-
-	err = dev_queue_xmit(skb);
-	if (err > 0)
-		err = net_xmit_errno(err);
-
-	if (err) {
-		kfree_skb(newskb);
-		return err;
-	}
-
-	if (newskb)
-		netif_rx(newskb);
-
-	return 0;
+	return ret;
 
 inval_skb:
 	kfree_skb(skb);
-	return err;
+	return ret;
 }
-EXPORT_SYMBOL(bshdbus2_send);
+EXPORT_SYMBOL(bshdbus_send);
 
-static struct bshdbus_dev_rcv_lists *bshdbus_dev_rcv_lists_find(struct net *net,
-		struct net_device *dev)
+static int bshdbus_map_skb_to_proto(struct sk_buff *skb, __u16 *proto)
+{
+	if (skb->protocol == htons(ETH_P_BSHDBUS2)) {
+		*proto = BSHDBUS_DBUS2;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static struct bshdbus_dev_rcvr_list *bshdbus_get_dev_rcvr_list(struct net *net,
+		struct net_device *net_dev, __u16 proto)
 {
 	struct bshdbus_ml_priv *bshdbus_ml;
 
-	if (dev) {
-		bshdbus_ml = bshdbus_get_ml_priv(dev);
-		return &bshdbus_ml->dev_rcv_lists;
+	if (net_dev) {
+		bshdbus_ml = bshdbus_get_ml_priv(net_dev);
+		if (proto == BSHDBUS_DBUS2)
+			return &bshdbus_ml->bshdbus2_rcvr_list;
 	}
 
 	return NULL;
 }
 
-static inline void bshdbus2_deliver(struct sk_buff *skb,
-		struct bshdbus2_receiver *rcv)
+static inline void bshdbus_deliver(struct sk_buff *skb,
+		struct bshdbus_receiver *rcvr)
 {
-	rcv->func(skb, rcv->data);
+	rcvr->deliver(skb, rcvr->data);
 }
 
-static void bshdbus2_frame_add_unique_id(struct bshdbus2_frame *dbus2_frame)
-{
-	while (!(dbus2_frame->unique_id))
-		dbus2_frame->unique_id = atomic64_inc_return(&unique_id);
-}
-
-static bool bshdbus2_is_broadcast_msg(__u8 addr)
-{
-	if (0x00 == (addr & 0xF0))
-		return true;
-	
-	return false;
-}
-
-static bool bshdbus2_is_msg_id_registered(__u16 msg_id_high, __u16 msg_id_low,
-		struct bshdbus2_msg_id_ranges *ids)
-{
-	__u16 cnt;
-	__u16 id_bit;
-	__u16 id_order;
-	__u16 msg_id = bshdbus2_get_msg_id(msg_id_high, msg_id_low);
-	struct bshdbus2_msg_id_range *range;
-
-	id_bit = bshdbus2_get_id_bit(msg_id);
-	id_order = bshdbus2_get_id_order(msg_id);
-
-	for (cnt = 0; cnt < ids->range_cnt; cnt++) {
-		range = &ids->ranges[cnt];
-
-		if (id_order == range->id_order && (id_bit & range->id_mask))
-			/* Entry found */
-			return true;
-		/* Ranges are ordered by their ID order, quit searching if only higher
-		 * orders exist
-		 */
-		else if (id_order < range->id_order) {
-			break;
-		}
-	}
-
-	return false;
-}
-
-static void bshdbus2_rcv_filter(struct bshdbus_dev_rcv_lists *dev_rcv_lists,
+static void bshdbus_rcv_filter(struct bshdbus_dev_rcvr_list *dev_rcvr_list,
 		struct sk_buff *skb)
 {
-	struct bshdbus2_receiver *rcv;
-	struct bshdbus2_frame *dbus2_frame = (struct bshdbus2_frame *)skb->data;
+	struct bshdbus_receiver *rcvr;
 
-	if (dev_rcv_lists->entries == 0)
+	if (dev_rcvr_list->entries == 0)
 		return;
 
-	hlist_for_each_entry_rcu(rcv, &dev_rcv_lists->rx, list) {
+	hlist_for_each_entry_rcu(rcvr, &dev_rcvr_list->rcvr_list, list) {
 		/* Deliver broadcast messages to all receivers */
-		if (bshdbus2_is_broadcast_msg(dbus2_frame->addr))
-			bshdbus2_deliver(skb, rcv);
+		if (skb->pkt_type == PACKET_BROADCAST)
+			bshdbus_deliver(skb, rcvr);
+		/* Deliver transmit indication only to the sender of the message */
+		else if (skb->pkt_type == PACKET_LOOPBACK &&
+				skb->sk == rcvr->sk) {
+			bshdbus_deliver(skb, rcvr);
+			return;
+		}
 		/* Deliver addressed message only to one particular receiver */
-		else if (dbus2_frame->addr == rcv->addr &&
-				bshdbus2_is_msg_id_registered(dbus2_frame->msg_id_high,
-						dbus2_frame->msg_id_low, rcv->ids)) {
-			bshdbus2_deliver(skb, rcv);
+		else if (skb->pkt_type == PACKET_USER &&
+				rcvr->check_deliver(skb, rcvr->data)) {
+			bshdbus_deliver(skb, rcvr);
 			return;
 		}
 	}
 }
 
-static void bshdbus2_receive(struct sk_buff *skb, struct net_device *dev)
+static int bshdbus_rcv(struct sk_buff *skb, struct net_device *net_dev,
+		struct packet_type *pt, struct net_device *orig_dev)
 {
-	struct bshdbus_dev_rcv_lists *dev_rcv_lists;
-	struct net *net = dev_net(dev);
+	struct bshdbus_dev_rcvr_list *dev_rcvr_list;
+	struct net *net = dev_net(net_dev);
+	__u16 proto;
+
+	if (unlikely(net_dev->type != ARPHRD_BSHDBUS || skb->len != BSHDBUS_MTU)) {
+		pr_warn_once("PF_BSHDBUS: Dropped BSHDBUS skb: dev type %d, len %d\n",
+				net_dev->type, skb->len);
+		goto free_skb;
+	}
+
+	if (bshdbus_map_skb_to_proto(skb, &proto)) {
+		dev_err(&net_dev->dev, "Unsupported protocol type\n");
+		goto free_skb;
+	}
 
 	rcu_read_lock();
 
-	dev_rcv_lists = bshdbus_dev_rcv_lists_find(net, dev);
-	if (dev_rcv_lists)
-		bshdbus2_rcv_filter(dev_rcv_lists, skb);
+	dev_rcvr_list = bshdbus_get_dev_rcvr_list(net, net_dev, proto);
+	if (dev_rcvr_list)
+		bshdbus_rcv_filter(dev_rcvr_list, skb);
 	else
-		dev_err(&dev->dev, "PF_BSHDBUS: Receiver list empty for dev %s\n",
-		DEV_NAME(dev));
+		dev_err(&net_dev->dev, "PF_BSHDBUS: Receiver list empty for dev %s\n",
+		DEV_NAME(net_dev));
 
 	rcu_read_unlock();
 
 	consume_skb(skb);
-}
-
-static int bshdbus2_rcv(struct sk_buff *skb, struct net_device *dev,
-		struct packet_type *pt, struct net_device *orig_dev)
-{
-	struct bshdbus2_frame *dbus2_frame = (struct bshdbus2_frame *)skb->data;
-
-	if (unlikely(dev->type != ARPHRD_BSHDBUS || skb->len != BSHDBUS2_MTU)) {
-		pr_warn_once("PF_BSHDBUS: Dropped BSHDBUS skb: dev type %d, len %d\n",
-				dev->type, skb->len);
-		goto free_skb;
-	}
-
-	bshdbus2_frame_add_unique_id(dbus2_frame);
-
-	bshdbus2_receive(skb, dev);
 
 	return NET_RX_SUCCESS;
 
@@ -347,114 +289,171 @@ free_skb:
 	return NET_RX_DROP;
 }
 
-static struct hlist_head *bshdbus2_rcv_list_find(__u8 addr,
-		struct bshdbus_dev_rcv_lists *dev_rcv_lists)
+static void bshdbus_rcvr_delete(struct rcu_head *rp)
 {
-	return &dev_rcv_lists->rx;
-}
-
-int bshdbus2_rx_register(struct net *net, struct net_device *dev, __u8 addr,
-		struct bshdbus2_msg_id_ranges *ids, void *data, char *ident,
-		void (*func)(struct sk_buff *, void *), struct sock *sk)
-{
-	int err;
-	struct hlist_head *rcv_list;
-	struct bshdbus2_receiver *rcv;
-	struct bshdbus_dev_rcv_lists *dev_rcv_lists;
-
-	if (dev && dev->type != ARPHRD_BSHDBUS)
-		return -ENODEV;
-
-	if (dev && !net_eq(net, dev_net(dev)))
-		return -ENODEV;
-
-	rcv = kmem_cache_alloc(rcv_cache, GFP_KERNEL);
-	if (!rcv)
-		return -ENOMEM;
-
-	spin_lock_bh(&net->bshdbus.rcvlists_lock);
-
-	dev_rcv_lists = bshdbus_dev_rcv_lists_find(net, dev);
-	rcv_list = bshdbus2_rcv_list_find(addr, dev_rcv_lists);
-
-	rcv->addr = addr;
-	rcv->func = func;
-	rcv->data = data;
-	rcv->ident = ident;
-	rcv->ids = ids;
-	rcv->sk = sk;
-
-	hlist_add_head_rcu(&rcv->list, rcv_list);
-	dev_rcv_lists->entries++;
-
-	spin_unlock_bh(&net->bshdbus.rcvlists_lock);
-
-	return err;
-}
-EXPORT_SYMBOL(bshdbus2_rx_register);
-
-static void bshdbus2_rx_delete_receiver(struct rcu_head *rp)
-{
-	struct bshdbus2_receiver *rcv = container_of(rp, struct bshdbus2_receiver,
+	struct bshdbus_receiver *rcvr = container_of(rp, struct bshdbus_receiver,
 			rcu);
-	struct sock *sk = rcv->sk;
+	struct sock *sk = rcvr->sk;
 
-	kmem_cache_free(rcv_cache, rcv);
+	kmem_cache_free(rcv_cache, rcvr);
 	if (sk)
 		sock_put(sk);
 }
 
-void bshdbus2_rx_unregister(struct net *net, struct net_device *dev, __u8 addr,
-		struct bshdbus2_msg_id_ranges *ids)
+/**
+ * bshdbus_rcvr_register - subscribe BSH D-Bus frames from a specific interface
+ * @net: the applicable net namespace
+ * @net_dev: pointer to netdevice
+ * @data: returned parameter for callback function
+ * @ident: string for calling module identification
+ * @deliver: callback function to deliver frame on filter match
+ * @check_deliver: callback function to check filter match for addressed frame
+ * @sk: socket pointer
+ *
+ * The check_deliver callback gets invoked for received addressed frames to find
+ * the matching subscriber. Only the first matching subscriber will receive the
+ * addressed frame.
+ *
+ * The callback function with the received sk_buff and the given parameter
+ * 'data' is invoked
+ *          - for all subscribers when a broadcast frame is received
+ *          - for a single subscriber when the check_deliver callback matches
+ *          - for a single subscriber to receive the transmit indication
+ *
+ * The provided pointer to the sk_buff is guaranteed to be valid as long as the
+ * callback function is running. The callback function must *not* free the given
+ * sk_buff while processing it's task. When the given sk_buff is needed after
+ * the end of the callback function it must be cloned inside the callback
+ * function with skb_clone().
+ *
+ * Return:
+ *  0 on success
+ *  -ENOMEM on missing cache mem to create subscription entry
+ *  -ENODEV on unknown network device
+ *  -EBUSY when socket is already registered
+ *  -EINVAL when net namespace, netdevice or socket pointer is NULL
+ */
+int bshdbus_rcvr_register(struct net *net, struct net_device *net_dev,
+		void *data, char *ident, void (*deliver)(struct sk_buff *, void *),
+		bool (*check_deliver)(struct sk_buff *, void *),
+		struct sock *sk)
 {
-	struct hlist_head *rcv_list;
-	struct bshdbus2_receiver *rcv = NULL;
-	struct bshdbus_dev_rcv_lists *dev_rcv_lists;
+	int ret = 0;
+	struct bshdbus_receiver *rcvr;
+	struct bshdbus_dev_rcvr_list *dev_rcvr_list;
 
-	if (dev && dev->type != ARPHRD_BSHDBUS)
+	if (!net || !net_dev || !sk)
+		return -EINVAL;
+
+	if (net_dev->type != ARPHRD_BSHDBUS)
+		return -ENODEV;
+
+	if (!net_eq(net, dev_net(net_dev)))
+		return -ENODEV;
+
+	spin_lock_bh(&net->bshdbus.rcvlists_lock);
+
+	dev_rcvr_list = bshdbus_get_dev_rcvr_list(net, net_dev, sk->sk_protocol);
+
+	hlist_for_each_entry_rcu(rcvr, &dev_rcvr_list->rcvr_list, list) {
+		if (rcvr->sk == sk) {
+			dev_warn(&net_dev->dev, "Receiver for this sock already registered\n");
+			ret = -EBUSY;
+			goto leave_without_registration;
+		}
+	}
+
+	rcvr = kmem_cache_alloc(rcv_cache, GFP_KERNEL);
+	if (!rcvr) {
+		dev_err(&net_dev->dev, "Allocate memory for receiver failed\n");
+		ret = -ENOMEM;
+		goto leave_without_registration;
+	}
+
+	rcvr->deliver = deliver;
+	rcvr->check_deliver = check_deliver;
+	rcvr->data = data;
+	rcvr->ident = ident;
+	rcvr->sk = sk;
+
+	hlist_add_head_rcu(&rcvr->list, &dev_rcvr_list->rcvr_list);
+	dev_rcvr_list->entries++;
+
+leave_without_registration:
+	spin_unlock_bh(&net->bshdbus.rcvlists_lock);
+	return ret;
+}
+EXPORT_SYMBOL(bshdbus_rcvr_register);
+
+/**
+ * bshdbus_rcvr_unregister - unsubscribe BSH D-Bus frames from an interface
+ * @net: the applicable net namespace
+ * @net_dev: pointer to netdevice
+ * @sk: socket pointer
+ *
+ * Removes subscription entry depending on given (subscription) values.
+ */
+void bshdbus_rcvr_unregister(struct net *net, struct net_device *net_dev,
+		struct sock *sk)
+{
+	struct bshdbus_receiver *rcvr = NULL;
+	struct bshdbus_dev_rcvr_list *dev_rcvr_list;
+
+	if (!net || !net_dev || !sk)
 		return;
 
-	if (dev && !net_eq(net, dev_net(dev)))
+	if (net_dev && net_dev->type != ARPHRD_BSHDBUS)
+		return;
+
+	if (net_dev && !net_eq(net, dev_net(net_dev)))
 		return;
 
 	spin_lock_bh(&net->bshdbus.rcvlists_lock);
 
-	dev_rcv_lists = bshdbus_dev_rcv_lists_find(net, dev);
-	rcv_list = bshdbus2_rcv_list_find(addr, dev_rcv_lists);
-
-	/* A message ID can be only registered once, find the receiver */
-	hlist_for_each_entry_rcu(rcv, rcv_list, list) {
-		if (rcv->addr == addr && 
-				rcv->ids->ranges[0].id_order == ids->ranges[0].id_order &&
-				rcv->ids->ranges[0].id_mask == ids->ranges[0].id_mask)
-			break;
-	}
-
-	if (!rcv) {
-		dev_warn(&dev->dev, "PF_BSHDBUS: No receive list, dev %s, addr %02x, \
-				id_order %d, id_mask %08llx\n", DEV_NAME(dev), addr,
-				ids->ranges[0].id_order, ids->ranges[0].id_mask);
+	dev_rcvr_list = bshdbus_get_dev_rcvr_list(net, net_dev, sk->sk_protocol);
+	if (!dev_rcvr_list) {
+		dev_warn(&net_dev->dev, "No device receiver found\n");
 		goto out;
 	}
 
-	hlist_del_rcu(&rcv->list);
-	dev_rcv_lists->entries--;
+	hlist_for_each_entry_rcu(rcvr, &dev_rcvr_list->rcvr_list, list) {
+		if (rcvr->sk == sk)
+			break;
+	}
+
+	if (!rcvr) {
+		dev_warn(&net_dev->dev, "No receiver found\n");
+		goto out;
+	}
+
+	hlist_del_rcu(&rcvr->list);
+	dev_rcvr_list->entries--;
 
 out:
 	spin_unlock_bh(&net->bshdbus.rcvlists_lock);
 
 	/* schedule the receiver item for deletion */
-	if (rcv) {
-		if (rcv->sk)
-			sock_hold(rcv->sk);
-		call_rcu(&rcv->rcu, bshdbus2_rx_delete_receiver);
+	if (rcvr) {
+		if (rcvr->sk)
+			sock_hold(rcvr->sk);
+		call_rcu(&rcvr->rcu, bshdbus_rcvr_delete);
 	}
 }
-EXPORT_SYMBOL(bshdbus2_rx_unregister);
+EXPORT_SYMBOL(bshdbus_rcvr_unregister);
 
+/**
+ * bshdbus_proto_register - register BSH D-Bus transport protocol
+ * @proto: pointer to BSH D-Bus protocol structure
+ *
+ * Return:
+ *  0 on success
+ *  -EINVAL invalid (out of range) protocol number
+ *  -EBUSY  protocol already in use
+ *  -EPROTO if proto_register() fails
+ */
 int bshdbus_proto_register(const struct bshdbus_proto *proto)
 {
-	int err;
+	int ret;
 
 	if (!proto) {
 		pr_err("bshdbus: Invalid proto pointer\n");
@@ -466,28 +465,32 @@ int bshdbus_proto_register(const struct bshdbus_proto *proto)
 		return -EINVAL;
 	}
 
-	err = proto_register(proto->prot, 0);
-	if (err < 0)
-		return err;
+	ret = proto_register(proto->prot, 0);
+	if (ret < 0)
+		return -EPROTO;
 
 	mutex_lock(&proto_tab_lock);
 
 	if (rcu_access_pointer(proto_tab[proto->protocol])) {
 		pr_err("bshdbus: Protocol %d already registered\n", proto->protocol);
-		err = -EBUSY;
+		ret = -EBUSY;
 	} else {
 		RCU_INIT_POINTER(proto_tab[proto->protocol], proto);
 	}
 
 	mutex_unlock(&proto_tab_lock);
 
-	if (err < 0)
+	if (ret < 0)
 		proto_unregister(proto->prot);
 
-	return err;
+	return ret;
 }
 EXPORT_SYMBOL(bshdbus_proto_register);
 
+/**
+ * bshdbus_proto_unregister - unregister BSH D-Bus transport protocol
+ * @proto: pointer to BSH D-Bus protocol structure
+ */
 void bshdbus_proto_unregister(const struct bshdbus_proto *proto)
 {
 	if (!proto) {
@@ -524,7 +527,7 @@ static struct pernet_operations bshdbus_pernet __read_mostly = {
 
 static struct packet_type bshdbus2_packet __read_mostly = {
 	.type = cpu_to_be16(ETH_P_BSHDBUS2),
-	.func = bshdbus2_rcv,
+	.func = bshdbus_rcv,
 };
 
 static const struct net_proto_family bshdbus_family = {
@@ -535,22 +538,20 @@ static const struct net_proto_family bshdbus_family = {
 
 static __init int bshdbus_init(void)
 {
-	int err;
+	int ret;
 
-	pr_info("bshdbus: BSH D-Bus core\n");
-
-	rcv_cache = kmem_cache_create("bshdbus2_receiver",
-			sizeof(struct bshdbus2_receiver),
+	rcv_cache = kmem_cache_create("bshdbus_receiver",
+			sizeof(struct bshdbus_receiver),
 			0, 0, NULL);
 	if (!rcv_cache)
 		return -ENOMEM;
 
-	err = register_pernet_subsys(&bshdbus_pernet);
-	if (err)
+	ret = register_pernet_subsys(&bshdbus_pernet);
+	if (ret)
 		goto out_pernet;
 
-	err = sock_register(&bshdbus_family);
-	if (err)
+	ret = sock_register(&bshdbus_family);
+	if (ret)
 		goto out_sock;
 
 	dev_add_pack(&bshdbus2_packet);
@@ -562,7 +563,7 @@ out_sock:
 out_pernet:
 	kmem_cache_destroy(rcv_cache);
 
-	return err;
+	return ret;
 }
 
 static __exit void bshdbus_exit(void)
@@ -576,6 +577,8 @@ static __exit void bshdbus_exit(void)
 
 	kmem_cache_destroy(rcv_cache);
 }
+
+#pragma GCC pop_options
 
 module_init(bshdbus_init);
 module_exit(bshdbus_exit);

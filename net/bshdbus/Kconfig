@@ -14,16 +14,6 @@ menuconfig BSHDBUS
 
 if BSHDBUS
 
-config BSHDBUS_DBUS2
-	tristate "BSH D-Bus-2 Protocol"
-	default y
-	help
-	  The raw BSH bus protocol option offers access to the BSH bus via
-	  the BSD socket API. You probably want to use the raw socket in
-	  most cases where no higher level protocol is being used.
-	  To receive/send raw BSH D-Bus-2 messages, use AF_BSHDBUS with protocol
-	  BSHDBUS_DBUS2.
-
 source "drivers/net/bshdbus/Kconfig"
 
 endif

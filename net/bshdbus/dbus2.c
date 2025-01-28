@@ -1,5 +1,5 @@
 /*------------------------------------------------------------------------------
- Copyright 2023 BSH Hausgeraete GmbH
+ Copyright 2024 BSH Hausgeraete GmbH
 
  Redistribution and use in source and binary forms, with or without
  modification, are permitted provided that the following conditions are met:
@@ -33,9 +33,10 @@
 #include <linux/netdevice.h>
 #include <net/sock.h>
 #include <linux/bshdbus.h>
+#include <linux/bshdbus/skb.h>
 #include <linux/bshdbus/core.h>
 
-MODULE_DESCRIPTION("PF_BSHDBUS D-Bus-2 protocol");
+MODULE_DESCRIPTION("PF_BSHDBUS D-Bus-2 Protocol");
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Wolfgang Birkner <wolfgang.birkner@bshg.com>");
 
@@ -48,6 +49,8 @@ struct dbus2_sock {
 	struct list_head notifier;
 	struct bshdbus2_msg_id_ranges ids;
 	struct sk_buff *skb;
+	struct net_device *net_dev; //TODO nötig?
+	netdevice_tracker dev_tracker;
 	__u8 addr;
 };
 
@@ -55,25 +58,30 @@ static LIST_HEAD(dbus2_notifier_list);
 static DEFINE_SPINLOCK(dbus2_notifier_lock);
 static struct dbus2_sock *dbus2_busy_notifier;
 
+#pragma GCC push_options
+#pragma GCC optimize ("O0")
+
 static struct dbus2_sock *bshdbus2_sk(const struct sock *sk)
 {
 	return (struct dbus2_sock *)sk;
 }
 
 static void bshdbus2_notify(struct dbus2_sock *dsock, unsigned long msg,
-		struct net_device *dev)
+		struct net_device *net_dev)
 {
 	struct sock *sk = &dsock->sk;
 
-	if (!net_eq(dev_net(dev), sock_net(sk)))
+	if (!net_eq(dev_net(net_dev), sock_net(sk)))
 		return;
 
-	if (dsock->ifindex != dev->ifindex)
+	if (dsock->ifindex != net_dev->ifindex)
 		return;
 
 	switch (msg) {
 	case NETDEV_UNREGISTER:
 		lock_sock(sk);
+
+		bshdbus_rcvr_unregister(sock_net(sk), net_dev, sk);
 
 		dsock->ifindex = 0;
 		dsock->bound = 0;
@@ -95,9 +103,9 @@ static void bshdbus2_notify(struct dbus2_sock *dsock, unsigned long msg,
 static int bshdbus2_notifier(struct notifier_block *nb, unsigned long msg,
 		void *ptr)
 {
-	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+	struct net_device *net_dev = netdev_notifier_info_to_dev(ptr);
 
-	if (dev->type != ARPHRD_BSHDBUS)
+	if (net_dev->type != ARPHRD_BSHDBUS)
 		return NOTIFY_DONE;
 
 	if (msg != NETDEV_UNREGISTER && msg != NETDEV_DOWN)
@@ -111,7 +119,7 @@ static int bshdbus2_notifier(struct notifier_block *nb, unsigned long msg,
 
 	list_for_each_entry(dbus2_busy_notifier, &dbus2_notifier_list, notifier) {
 		spin_unlock(&dbus2_notifier_lock);
-		bshdbus2_notify(dbus2_busy_notifier, msg, dev);
+		bshdbus2_notify(dbus2_busy_notifier, msg, net_dev);
 		spin_lock(&dbus2_notifier_lock);
 	}
 
@@ -122,138 +130,16 @@ static int bshdbus2_notifier(struct notifier_block *nb, unsigned long msg,
 	return NOTIFY_DONE;
 }
 
-static int bshdbus2_init(struct sock *sk)
+static void bshdbus2_skb_add_sockaddr(struct sk_buff *skb)
 {
-	struct dbus2_sock *dsock = bshdbus2_sk(sk);
+	struct bshdbus_sockaddr *addr;
 
-	dsock->bound = 0;
-	dsock->ifindex = 0;
+	sock_skb_cb_check_size(sizeof(struct bshdbus_sockaddr));
 
-	spin_lock(&dbus2_notifier_lock);
-	list_add_tail(&dsock->notifier, &dbus2_notifier_list);
-	spin_unlock(&dbus2_notifier_lock);
-
-	return 0;
-}
-
-static int bshdbus2_bind(struct socket *sock, struct sockaddr *uaddr, int len)
-{
-	struct bshdbus_sockaddr *addr = (struct bshdbus_sockaddr *)uaddr;
-	struct sock *sk = sock->sk;
-	struct dbus2_sock *dsock = bshdbus2_sk(sk);
-	struct net_device *dev;
-	int err = 0;
-	int notify_enetdown = 0;
-
-	if (len < BSHDBUS2_MIN_NAMELEN)
-		return -EINVAL;
-
-	if (addr->bshdbus_family != AF_BSHDBUS)
-		return -EINVAL;
-
-	lock_sock(sk);
-
-	if (dsock->bound)
-		goto out;
-
-	dev = dev_get_by_index(sock_net(sk), addr->ifindex);
-	if (!dev) {
-		err = -ENODEV;
-		goto out;
-	}
-
-	if (dev->type != ARPHRD_BSHDBUS) {
-		dev_put(dev);
-		err = -ENODEV;
-		goto out;
-	}
-
-	dsock->addr = addr->bshdbus_addr.dbus2.addr;
-
-	if (!(dev->flags & IFF_UP))
-		notify_enetdown = 1;
-
-	dev_put(dev);
-
-	if (!err)
-		dsock->bound = 1;
-
-out:
-	release_sock(sk);
-
-	if (notify_enetdown) {
-		sk->sk_err = ENETDOWN;
-		if (!sock_flag(sk, SOCK_DEAD))
-			sk->sk_error_report(sk);
-	}
-
-	return err;
-}
-
-static int bshdbus2_release(struct socket *sock)
-{
-	struct sock *sk = sock->sk;
-	struct dbus2_sock *dsock;
-	struct net_device *dev;
-
-	if (!sk)
-		return 0;
-
-	dsock = bshdbus2_sk(sk);
-
-	spin_lock(&dbus2_notifier_lock);
-
-	while (dbus2_busy_notifier == dsock) {
-		spin_unlock(&dbus2_notifier_lock);
-		schedule_timeout_uninterruptible(1);
-		spin_lock(&dbus2_notifier_lock);
-	}
-
-	list_del(&dsock->notifier);
-
-	spin_unlock(&dbus2_notifier_lock);
-
-	lock_sock(sk);
-
-	if (dsock->bound) {
-		dev = dev_get_by_index(sock_net(sk), dsock->ifindex);
-		if (dev) {
-			// TODO unregister message ids
-			dev_put(dev);
-		}
-	}
-
-	dsock->ifindex = 0;
-	dsock->bound = 0;
-
-	sock_orphan(sk);
-	sock->sk = NULL;
-
-	release_sock(sk);
-	sock_put(sk);
-
-	return 0;
-}
-
-static int bshdbus2_check_id_ranges(__u16 ids_count,
-		struct bshdbus2_msg_id_range *ids)
-{
-	int i;
-	__u16 previous_id_order = -1;
-
-	for (i = 0; i < ids_count; i++) {
-		if (BSHDBUS2_ID_MAX_ORDER < ids[ids_count].id_order) {
-			pr_err("bshdbus2: Message ID order %d exceeds the limit %d\n",
-					ids[ids_count].id_order, BSHDBUS2_ID_MAX_ORDER);
-			return -EINVAL;
-		}
-		else if (previous_id_order >= ids[ids_count].id_order) {
-			pr_err("bshdbus2: Incorrect message ID order\n");
-			return -EINVAL;
-		}
-	}
-
-	return 0;
+	addr = (struct bshdbus_sockaddr *)skb->cb;
+	memset(addr, 0, sizeof(*addr));
+	addr->bshdbus_family = AF_BSHDBUS;
+	addr->ifindex = skb->dev->ifindex;
 }
 
 /* Return pointer to store the extra msg flags for bshdbus2_recvmsg().
@@ -269,26 +155,14 @@ static inline unsigned int *bshdbus2_flags(struct sk_buff *skb)
 	return (unsigned int *)(&((struct bshdbus_sockaddr *)skb->cb)[1]);
 }
 
-static void bshdbus2_skb_add_sockaddr(struct sk_buff *skb)
-{
-	struct bshdbus_sockaddr *addr;
-
-	sock_skb_cb_check_size(sizeof(struct bshdbus_sockaddr));
-
-	addr = (struct bshdbus_sockaddr *)skb->cb;
-	memset(addr, 0, sizeof(*addr));
-	addr->bshdbus_family = AF_BSHDBUS;
-	addr->ifindex = skb->dev->ifindex;
-}
-
-static void bshdbus2_rcv(struct sk_buff *oskb, void *data)
+static void bshdbus2_deliver(struct sk_buff *oskb, void *data)
 {
 	struct sock *sk = (struct sock *)data;
 	struct dbus2_sock *dsock = bshdbus2_sk(sk);
 	struct sk_buff *skb;
 	unsigned int *pflags;
 
-	if (oskb->len != BSHDBUS2_MTU)
+	if (oskb->len != BSHDBUS_MTU)
 		return;
 
 	dsock->skb = oskb;
@@ -311,16 +185,200 @@ static void bshdbus2_rcv(struct sk_buff *oskb, void *data)
 		kfree_skb(skb);
 }
 
+static bool bshdbus2_is_msg_id_registered(__u16 msg_id_high, __u16 msg_id_low,
+		struct bshdbus2_msg_id_ranges *ids)
+{
+	struct bshdbus2_msg_id_range *range;
+	__u64 id_bit;
+	__u16 cnt, id_order, msg_id;
+
+	msg_id = bshdbus2_get_msg_id(msg_id_high, msg_id_low);
+	id_bit = bshdbus2_get_id_bit(msg_id);
+	id_order = bshdbus2_get_id_order(msg_id);
+
+	for (cnt = 0; cnt < ids->range_cnt; cnt++) {
+		range = &ids->ranges[cnt];
+
+		if (id_order == range->id_order && (id_bit & range->id_mask))
+			/* Entry found */
+			return true;
+		/* Ranges are ordered by their ID order, quit searching if only higher
+		 * orders exist
+		 */
+		else if (id_order < range->id_order) {
+			break;
+		}
+	}
+
+	return false;
+}
+
+static bool bshdbus2_check_deliver(struct sk_buff *skb, void *data)
+{
+	struct sock *sk = (struct sock *)data;
+	struct dbus2_sock *dsock = bshdbus2_sk(sk);
+	struct bshdbus2_frame *dbus2_frame = (struct bshdbus2_frame *)skb->data;
+
+	if (dbus2_frame->addr == dsock->addr &&
+			bshdbus2_is_msg_id_registered(dbus2_frame->msg_id_high,
+					dbus2_frame->msg_id_low, &dsock->ids)) {
+			return true;
+	}
+
+	return false;
+}
+
+static int bshdbus2_init(struct sock *sk)
+{
+	struct dbus2_sock *dsock = bshdbus2_sk(sk);
+
+	dsock->bound = 0;
+	dsock->ifindex = 0;
+
+	sk->sk_protocol = BSHDBUS_DBUS2;
+
+	spin_lock(&dbus2_notifier_lock);
+	list_add_tail(&dsock->notifier, &dbus2_notifier_list);
+	spin_unlock(&dbus2_notifier_lock);
+
+	return 0;
+}
+
+static int bshdbus2_bind(struct socket *sock, struct sockaddr *uaddr, int len)
+{
+	struct bshdbus_sockaddr *addr = (struct bshdbus_sockaddr *)uaddr;
+	struct sock *sk = sock->sk;
+	struct dbus2_sock *dsock = bshdbus2_sk(sk);
+	struct net_device *net_dev;
+	int ret = 0;
+	int notify_enetdown = 0;
+
+	if (len < BSHDBUS2_MIN_NAMELEN)
+		return -EINVAL;
+
+	if (addr->bshdbus_family != AF_BSHDBUS)
+		return -EINVAL;
+
+	lock_sock(sk);
+
+	if (dsock->bound)
+		goto out;
+
+	net_dev = dev_get_by_index(sock_net(sk), addr->ifindex);
+	if (!net_dev) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	if (net_dev->type != ARPHRD_BSHDBUS) {
+		dev_put(net_dev);
+		ret = -ENODEV;
+		goto out;
+	}
+
+	dsock->addr = addr->bshdbus_addr.dbus2.addr;
+
+	if (!(net_dev->flags & IFF_UP))
+		notify_enetdown = 1;
+
+	ret = bshdbus_rcvr_register(sock_net(sk), net_dev, sk, "bshdbus2",
+			bshdbus2_deliver, bshdbus2_check_deliver, sk);
+	if (!ret) {
+		dsock->bound = 1;
+		dsock->ifindex = addr->ifindex;
+		/* hold a reference for new dsock->dev */
+		dsock->net_dev = net_dev;
+		if (dsock->net_dev)
+			netdev_hold(dsock->net_dev, &dsock->dev_tracker, GFP_KERNEL);
+	}
+
+	dev_put(net_dev);
+
+out:
+	release_sock(sk);
+
+	if (notify_enetdown) {
+		sk->sk_err = ENETDOWN;
+		if (!sock_flag(sk, SOCK_DEAD))
+			sk->sk_error_report(sk);
+	}
+
+	return ret;
+}
+
+static int bshdbus2_release(struct socket *sock)
+{
+	struct sock *sk = sock->sk;
+	struct dbus2_sock *dsock;
+	struct net_device *net_dev;
+
+	if (!sk)
+		return 0;
+
+	dsock = bshdbus2_sk(sk);
+
+	spin_lock(&dbus2_notifier_lock);
+
+	while (dbus2_busy_notifier == dsock) {
+		spin_unlock(&dbus2_notifier_lock);
+		schedule_timeout_uninterruptible(1);
+		spin_lock(&dbus2_notifier_lock);
+	}
+
+	list_del(&dsock->notifier);
+
+	spin_unlock(&dbus2_notifier_lock);
+
+	lock_sock(sk);
+
+	if (dsock->bound) {
+		net_dev = dev_get_by_index(sock_net(sk), dsock->ifindex);
+		if (net_dev) {
+			bshdbus_rcvr_unregister(sock_net(sk), net_dev, sk);
+			dev_put(net_dev);
+		}
+	}
+
+	dsock->ifindex = 0;
+	dsock->bound = 0;
+
+	sock_orphan(sk);
+	sock->sk = NULL;
+
+	release_sock(sk);
+	sock_put(sk);
+
+	return 0;
+}
+
+static int bshdbus2_check_id_ranges(__u16 ids_count,
+		struct bshdbus2_msg_id_range *ids)
+{
+	int i;
+	__s32 previous_id_order = -1;
+
+	for (i = 0; i < ids_count; i++) {
+		if (BSHDBUS2_ID_MAX_ORDER < ids[i].id_order) {
+			pr_err("bshdbus2: Message ID order %d exceeds the limit %d\n",
+					ids[ids_count].id_order, BSHDBUS2_ID_MAX_ORDER);
+			return -EINVAL;
+		}
+		else if (previous_id_order >= ids[i].id_order) {
+			pr_err("bshdbus2: Incorrect message ID order\n");
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
 static int bshdbus2_set_msg_ids(struct socket *sock, sockptr_t optval,
 		unsigned int optlen)
 {
 	struct sock *sk = sock->sk;
 	struct dbus2_sock *dsock = bshdbus2_sk(sk);
-	struct bshdbus2_msg_id_ranges *ids = NULL;
 	struct bshdbus2_msg_id_range *id_ranges = NULL;
-	struct net_device *dev = NULL;
-	int err = 0;
-	int range_cnt;
+	int range_cnt, ret = 0;
 
 	if (optlen % sizeof(struct bshdbus2_msg_id_range) != 0)
 		return -EINVAL;
@@ -347,61 +405,61 @@ static int bshdbus2_set_msg_ids(struct socket *sock, sockptr_t optval,
 	else
 		return -EINVAL;
 
-	err = bshdbus2_check_id_ranges(range_cnt, id_ranges);
-	if (err) {
+	ret = bshdbus2_check_id_ranges(range_cnt, id_ranges);
+	if (ret) {
 		kfree(id_ranges);
-		return err;
+		return ret;
 	}
 
-	dsock->ids.ranges = ids->ranges;
-	dsock->ids.range_cnt = ids->range_cnt;
-
+	dsock->ids.ranges = id_ranges;
+	dsock->ids.range_cnt = range_cnt;
+/*
 	rtnl_lock();
 	lock_sock(sk);
 
-	dev = dev_get_by_index(sock_net(sk), dsock->ifindex);
-	if (!dev) {
-		err = -ENODEV;
+	net_dev = dev_get_by_index(sock_net(sk), dsock->ifindex);
+	if (!net_dev) {
+		ret = -ENODEV;
 		goto out_cleanup;
-	}
-
-	err = bshdbus2_rx_register(sock_net(sk), dev, dsock->addr, &dsock->ids, sk,
+	} */
+/*
+	ret = bshdbus2_rcvr_id_register(sock_net(sk), dev, dsock->addr, &dsock->ids, sk,
 			"bshdbus2", bshdbus2_rcv, sk);
-	if (err)
-		goto out_cleanup;
-
+	if (ret)
+		goto out_cleanup; */
+/*
 out_cleanup:
-	if (dev)
-		dev_put(dev);
+	if (net_dev)
+		dev_put(net_dev);
 
-	if (err) {
+	if (ret) {
 		kfree(id_ranges);
 		dsock->ids.range_cnt = 0;
 	}
 
 	release_sock(sk);
 	rtnl_unlock();
-
-	return err;
+*/
+	return ret;
 }
 
 static int bshdbus2_setsockopt(struct socket *sock, int level, int optname,
 		sockptr_t optval, unsigned int optlen)
 {
-	int err;
+	int ret;
 
 	if (level != SOL_BSHDBUS_DBUS2)
 		return -EINVAL;
 
 	switch (optname) {
 	case BSHDBUS_DBUS2_MSG_ID:
-		err = bshdbus2_set_msg_ids(sock, optval, optlen);
+		ret = bshdbus2_set_msg_ids(sock, optval, optlen);
 		break;
 	default:
 		return -ENOPROTOOPT;
 	}
 
-	return err;
+	return ret;
 }
 
 static int bshdbus2_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
@@ -409,23 +467,23 @@ static int bshdbus2_recvmsg(struct socket *sock, struct msghdr *msg, size_t size
 {
 	struct sock *sk = sock->sk;
 	struct sk_buff *skb;
-	int err = 0;
+	int ret = 0;
 
 // TODO check flags
 
-	skb = skb_recv_datagram(sk, flags, &err);
+	skb = skb_recv_datagram(sk, flags, &ret);
 	if (!skb)
-		return err;
+		return ret;
 
 	if (size < skb->len)
 		msg->msg_flags |= MSG_TRUNC;
 	else
 		size = skb->len;
 
-	err = memcpy_to_msg(msg, skb->data, size);
-	if (err < 0) {
+	ret = memcpy_to_msg(msg, skb->data, size);
+	if (ret < 0) {
 		skb_free_datagram(sk, skb);
-		return err;
+		return ret;
 	}
 
 //	sock_recv_ts_and_drops(msg, sk, skb); TODO
@@ -448,11 +506,12 @@ static int bshdbus2_sendmsg(struct socket *sock, struct msghdr *msg, size_t size
 	struct sock *sk = sock->sk;
 	struct dbus2_sock *dsock = bshdbus2_sk(sk);
 	struct sk_buff *skb;
-	struct net_device *dev;
+	struct net_device *net_dev;
+	struct bshdbus2_frame *dbus2_frame;
 	int ifindex;
-	int err;
+	int ret;
 
-	if (msg->msg_name) {
+	if (msg->msg_name) { // TODO: nötig?
 		DECLARE_SOCKADDR(struct bshdbus_sockaddr *, addr, msg->msg_name);
 
 		if (msg->msg_namelen < BSHDBUS2_MIN_NAMELEN)
@@ -465,43 +524,44 @@ static int bshdbus2_sendmsg(struct socket *sock, struct msghdr *msg, size_t size
 	} else
 		ifindex = dsock->ifindex;
 
-	dev = dev_get_by_index(sock_net(sk), ifindex);
-	if (!dev)
+	net_dev = dev_get_by_index(sock_net(sk), ifindex);
+	if (!net_dev)
 		return -ENXIO;
-/*
-	err = -EINVAL;
-	if (ro->fd_frames && dev->mtu == CANFD_MTU) {
-		if (unlikely(size != CANFD_MTU && size != CAN_MTU))
-			goto put_dev;
-	} else {
-		if (unlikely(size != CAN_MTU))
-			goto put_dev;
+
+	if (unlikely(size != BSHDBUS_MTU)) {
+		ret = -EINVAL;
+		goto put_dev;
 	}
-*/
-//	skb = sock_alloc_send_skb(sk, size + sizeof(struct can_skb_priv),
-//				  msg->msg_flags & MSG_DONTWAIT, &err);
+
+	skb = sock_alloc_send_skb(sk, size + sizeof(struct bshdbus_skb_priv),
+				msg->msg_flags & MSG_DONTWAIT, &ret);
 	if (!skb)
 		goto put_dev;
 
-//	can_skb_reserve(skb);
-//	can_skb_prv(skb)->ifindex = dev->ifindex;
-//	can_skb_prv(skb)->skbcnt = 0;
+	bshdbus_skb_reserve(skb);
 
-	err = memcpy_from_msg(skb_put(skb, size), msg, size);
-	if (err < 0)
+	ret = memcpy_from_msg(skb_put(skb, size), msg, size);
+	if (ret < 0)
 		goto free_skb;
+
+	dbus2_frame = (struct bshdbus2_frame *)skb->data;
+	if (unlikely(dbus2_frame->data_len > BSHDBUS2_MAX_DATA_LEN)) {
+		ret = -EINVAL;
+		goto free_skb;
+	}
+	dbus2_frame->flags = 0;
 
 	skb_setup_tx_timestamp(skb, sk->sk_tsflags);
 
-	skb->dev = dev;
+	skb->dev = net_dev;
 	skb->sk = sk;
 	skb->priority = sk->sk_priority;
 
-//	err = can_send(skb, ro->loopback);
+	ret = bshdbus_send(skb, htons(ETH_P_BSHDBUS2));
 
-	dev_put(dev);
+	dev_put(net_dev);
 
-	if (err)
+	if (ret)
 		goto send_failed;
 
 	return size;
@@ -509,9 +569,9 @@ static int bshdbus2_sendmsg(struct socket *sock, struct msghdr *msg, size_t size
 free_skb:
 	kfree_skb(skb);
 put_dev:
-	dev_put(dev);
+	dev_put(net_dev);
 send_failed:
-	return err;
+	return ret;
 }
 
 static const struct proto_ops dbus2_ops = {
@@ -550,26 +610,24 @@ static struct notifier_block dbus2_notifier_block = {
 
 static __init int bshdbus2_module_init(void)
 {
-	int err;
+	int ret;
 
-	pr_info("bshdbus2: D-Bus-2 protocol\n");
-
-	err = bshdbus_proto_register(&bshdbus2_proto);
-	if (err)
+	ret = bshdbus_proto_register(&bshdbus2_proto);
+	if (ret)
 		pr_err("bshdbus2: Register D-Bus-2 protocol failed\n");
 	else {
-		err = register_netdevice_notifier(&dbus2_notifier_block);
-		if (err) {
+		ret = register_netdevice_notifier(&dbus2_notifier_block);
+		if (ret) {
 			pr_err("bshdbus2: Register netdevice notifier failed\n");
 			goto err_proto_unregister;
 		}
 	}
 
-	return err;
+	return ret;
 
 err_proto_unregister:
 	bshdbus_proto_unregister(&bshdbus2_proto);
-	return err;
+	return ret;
 }
 
 static __exit void bshdbus2_module_exit(void)
@@ -577,6 +635,8 @@ static __exit void bshdbus2_module_exit(void)
 	bshdbus_proto_unregister(&bshdbus2_proto);
 	unregister_netdevice_notifier(&dbus2_notifier_block);
 }
+
+#pragma GCC pop_options
 
 module_init(bshdbus2_module_init);
 module_exit(bshdbus2_module_exit);

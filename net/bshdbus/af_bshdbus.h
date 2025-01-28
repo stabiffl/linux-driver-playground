@@ -33,13 +33,12 @@
 #include <linux/list.h>
 #include <linux/skbuff.h>
 
-struct bshdbus2_receiver {
+struct bshdbus_receiver {
 	struct hlist_node list;
-	__u8 addr;
-	void (*func)(struct sk_buff *skb, void *data);
+	void (*deliver)(struct sk_buff *skb, void *data);
+	bool (*check_deliver)(struct sk_buff *skb, void *data);
 	void *data;
 	char *ident;
-	struct bshdbus2_msg_id_ranges *ids;
 	struct sock *sk;
 	struct rcu_head rcu;
 };
