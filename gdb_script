@@ -1,0 +1,12 @@
+set substitute-path /lib/modules/6.10.0-00002-g1fcb66d70a65-dirty/kernel/net/bshdbus/bshdbus.ko /tmp/modules/lib/modules/6.10.0-00002-g1fcb66d70a65-dirty/kernel/net/bshdbus/bshdbus.ko
+add-symbol-file /tmp/modules/lib/modules/6.10.0-00002-g1fcb66d70a65-dirty/kernel/net/bshdbus/bshdbus.ko 0xffff800079730000
+
+set substitute-path /lib/modules/6.10.0-00002-g1fcb66d70a65-dirty/kernel/net/bshdbus/bshdbus_dbus2.ko /tmp/modules/lib/modules/6.10.0-00002-g1fcb66d70a65-dirty/kernel/net/bshdbus/bshdbus_dbus2.ko
+add-symbol-file /tmp/modules/lib/modules/6.10.0-00002-g1fcb66d70a65-dirty/kernel/net/bshdbus/bshdbus_dbus2.ko 0xffff80007973d000
+
+set substitute-path /lib/modules/6.10.0-00002-g1fcb66d70a65-dirty/kernel/drivers/net/bshdbus/bshdbus_netdev.ko /tmp/modules/lib/modules/6.10.0-00002-g1fcb66d70a65-dirty/kernel/drivers/net/bshdbus/bshdbus_netdev.ko
+add-symbol-file /tmp/modules/lib/modules/6.10.0-00002-g1fcb66d70a65-dirty/kernel/drivers/net/bshdbus/bshdbus_netdev.ko 0xffff800079738000
+
+set substitute-path /lib/modules/6.10.0-00002-g1fcb66d70a65-dirty/kernel/drivers/net/bshdbus/dbus2/dbus2_test.ko /tmp/modules/lib/modules/6.10.0-00002-g1fcb66d70a65-dirty/kernel/drivers/net/bshdbus/dbus2/dbus2_test.ko
+add-symbol-file /tmp/modules/lib/modules/6.10.0-00002-g1fcb66d70a65-dirty/kernel/drivers/net/bshdbus/dbus2/dbus2_test.ko 0xffff80007974c000
+
